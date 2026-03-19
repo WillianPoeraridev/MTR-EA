@@ -1,0 +1,22 @@
+# .NET build artifacts
+bin/
+obj/
+publish/
+
+# cTrader
+*.algo
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.cache
+
+# VS Code
+.vscode/
+
+# OS files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
