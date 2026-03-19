@@ -6,17 +6,24 @@ using System.Linq;
 using cAlgo.API;
 using cAlgo.API.Internals;
 using cAlgo.Robots.Models;
+using cAlgo.Robots.Utils;
 
 namespace cAlgo.Robots.Core;
 
 /// <summary>
 /// Draws and maintains dynamic trendlines from swing points.
 /// Detects Trend Line Breaks (TLBs) — the critical first step in an MTR setup.
-/// Only Major TL breaks (≥20 bars between anchor points) qualify for MTR.
+/// Only Major TL breaks (≥12 bars between anchor points) qualify for MTR.
+/// Requires minimum ATR-based margin for TLB confirmation (hysteresis).
 /// </summary>
 public class TrendLineTracker
 {
     private readonly SwingPointTracker _swingTracker;
+    private readonly Logger _logger;
+
+    private const int MajorThresholdBars = 12;   // 1 hour on M5 (was 20)
+    private const int MinPointSeparation = 8;     // 40 min on M5
+    private const double TlbMarginPercent = 0.5;  // Close must be 0.5*ATR beyond TL
 
     // Track previous swing point counts to detect when new swings are confirmed
     private int _lastSwingHighCount;
@@ -43,26 +50,24 @@ public class TrendLineTracker
     /// <summary>Data about the most recent TLB event.</summary>
     public TlbInfo? LastTlb { get; private set; }
 
-    /// <summary>Total number of TLBs detected (used as a strength factor — prior TLBs increase MTR reliability).</summary>
+    /// <summary>Total number of TLBs detected (used as a strength factor).</summary>
     public int TlbCount { get; private set; }
 
     /// <summary>
     /// Creates a new TrendLineTracker.
     /// </summary>
     /// <param name="swingTracker">The swing point tracker to source anchor points from.</param>
-    public TrendLineTracker(SwingPointTracker swingTracker)
+    /// <param name="logger">Logger for TLB event diagnostics.</param>
+    public TrendLineTracker(SwingPointTracker swingTracker, Logger logger)
     {
         _swingTracker = swingTracker;
+        _logger = logger;
     }
 
     /// <summary>
     /// Updates trendlines and checks for breaks. Called once per bar.
     /// TLB flags are EVENT-based: set on the bar the break occurs, reset on the next call.
     /// </summary>
-    /// <param name="bars">The cTrader Bars data series.</param>
-    /// <param name="currentIndex">Index of the closed bar being analyzed.</param>
-    /// <param name="ema20">Current EMA 20 value.</param>
-    /// <param name="atr20">Current ATR 20 value.</param>
     public void Update(Bars bars, int currentIndex, double ema20, double atr20)
     {
         // Reset TLB event flags from previous bar (they are single-bar events)
@@ -77,75 +82,111 @@ public class TrendLineTracker
     }
 
     /// <summary>
-    /// Rebuilds trendlines from the most recent swing points when new swings appear.
-    /// Bull TL: connects the 2 most recent swing lows.
-    /// Bear TL: connects the 2 most recent swing highs.
+    /// Rebuilds trendlines from swing points with minimum separation.
+    /// Selects the 2 most recent swing points that are at least MinPointSeparation bars apart.
+    /// If no two swings meet the separation requirement, the TL is set to null.
     /// </summary>
     private void RebuildTrendLines()
     {
-        var highs = _swingTracker.GetRecentHighs(2);
-        var lows = _swingTracker.GetRecentLows(2);
+        var highs = _swingTracker.GetRecentHighs(5); // Get more to find well-separated pair
+        var lows = _swingTracker.GetRecentLows(5);
 
         // Detect if new swing points were added
-        bool newHighs = highs.Count != _lastSwingHighCount;
-        bool newLows = lows.Count != _lastSwingLowCount;
-        _lastSwingHighCount = highs.Count;
-        _lastSwingLowCount = lows.Count;
+        int currentHighCount = _swingTracker.GetRecentHighs(20).Count;
+        int currentLowCount = _swingTracker.GetRecentLows(20).Count;
+        bool newHighs = currentHighCount != _lastSwingHighCount;
+        bool newLows = currentLowCount != _lastSwingLowCount;
+        _lastSwingHighCount = currentHighCount;
+        _lastSwingLowCount = currentLowCount;
 
-        // Bull TL: connects 2 swing lows (support line)
-        if (lows.Count >= 2 && (newLows || ActiveBullTrendLine == null))
+        // Bull TL: connects 2 swing lows with minimum separation
+        if (newLows || ActiveBullTrendLine == null)
         {
-            var p1 = lows[lows.Count - 2];
-            var p2 = lows[lows.Count - 1];
-            int barsBetween = p2.BarIndex - p1.BarIndex;
-            double slope = barsBetween > 0
-                ? (p2.Price - p1.Price) / barsBetween
-                : 0.0;
-
-            ActiveBullTrendLine = new TrendLine
+            var pair = FindSeparatedPair(lows);
+            if (pair != null)
             {
-                Point1 = p1,
-                Point2 = p2,
-                Slope = slope,
-                // Brooks: Major TL has ≥20 bars between anchor points
-                IsMajor = barsBetween >= 20
-            };
+                var (p1, p2) = pair.Value;
+                int barsBetween = p2.BarIndex - p1.BarIndex;
+                double slope = barsBetween > 0 ? (p2.Price - p1.Price) / barsBetween : 0.0;
+
+                ActiveBullTrendLine = new TrendLine
+                {
+                    Point1 = p1,
+                    Point2 = p2,
+                    Slope = slope,
+                    IsMajor = barsBetween >= MajorThresholdBars
+                };
+            }
+            else
+            {
+                ActiveBullTrendLine = null; // Not enough well-separated swings
+            }
         }
 
-        // Bear TL: connects 2 swing highs (resistance line)
-        if (highs.Count >= 2 && (newHighs || ActiveBearTrendLine == null))
+        // Bear TL: connects 2 swing highs with minimum separation
+        if (newHighs || ActiveBearTrendLine == null)
         {
-            var p1 = highs[highs.Count - 2];
-            var p2 = highs[highs.Count - 1];
-            int barsBetween = p2.BarIndex - p1.BarIndex;
-            double slope = barsBetween > 0
-                ? (p2.Price - p1.Price) / barsBetween
-                : 0.0;
-
-            ActiveBearTrendLine = new TrendLine
+            var pair = FindSeparatedPair(highs);
+            if (pair != null)
             {
-                Point1 = p1,
-                Point2 = p2,
-                Slope = slope,
-                IsMajor = barsBetween >= 20
-            };
+                var (p1, p2) = pair.Value;
+                int barsBetween = p2.BarIndex - p1.BarIndex;
+                double slope = barsBetween > 0 ? (p2.Price - p1.Price) / barsBetween : 0.0;
+
+                ActiveBearTrendLine = new TrendLine
+                {
+                    Point1 = p1,
+                    Point2 = p2,
+                    Slope = slope,
+                    IsMajor = barsBetween >= MajorThresholdBars
+                };
+            }
+            else
+            {
+                ActiveBearTrendLine = null;
+            }
         }
     }
 
     /// <summary>
-    /// Checks if the closed bar breaks any active trendline by CLOSE (not wick).
-    /// A break means the close is beyond the extrapolated trendline price.
+    /// Finds the 2 most recent swing points separated by at least MinPointSeparation bars.
+    /// Returns null if no valid pair exists.
+    /// </summary>
+    private (SwingPoint p1, SwingPoint p2)? FindSeparatedPair(List<SwingPoint> points)
+    {
+        if (points.Count < 2) return null;
+
+        // Try pairs from most recent backwards
+        for (int j = points.Count - 1; j >= 1; j--)
+        {
+            for (int i = j - 1; i >= 0; i--)
+            {
+                if (points[j].BarIndex - points[i].BarIndex >= MinPointSeparation)
+                    return (points[i], points[j]);
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Checks if the closed bar breaks any active trendline by CLOSE with ATR margin.
+    /// Bull TL break: trendlinePrice - close > 0.5 * ATR (close significantly BELOW support).
+    /// Bear TL break: close - trendlinePrice > 0.5 * ATR (close significantly ABOVE resistance).
     /// </summary>
     private void CheckForBreaks(Bars bars, int currentIndex, double ema20, double atr20)
     {
         double close = bars.ClosePrices[currentIndex];
+        double margin = TlbMarginPercent * atr20;
 
-        // Bull TL break: close BELOW the bull trendline → bearish signal
-        if (ActiveBullTrendLine != null)
+        // Bull TL break: close BELOW the bull trendline with margin → bearish signal
+        if (ActiveBullTrendLine != null && atr20 > 0)
         {
             double tlPrice = ActiveBullTrendLine.GetPriceAt(currentIndex);
-            if (close < tlPrice)
+            double breakDistance = tlPrice - close; // Positive = close is below TL
+            if (breakDistance > margin)
             {
+                int barsBetween = ActiveBullTrendLine.Point2.BarIndex - ActiveBullTrendLine.Point1.BarIndex;
                 HasBullTlb = true;
                 TlbCount++;
                 LastTlb = new TlbInfo
@@ -156,15 +197,18 @@ public class TrendLineTracker
                     IsMajorBreak = ActiveBullTrendLine.IsMajor,
                     Strength = CalculateTlbStrength(bars, currentIndex, close, ActiveBullTrendLine, ema20, atr20, isBullBreak: false)
                 };
+                _logger.Debug($"TLB detected: {(LastTlb.IsMajorBreak ? "MAJOR" : "MICRO")} Bull TL broken | Strength={LastTlb.Strength:F2} | Bars between points={barsBetween}");
             }
         }
 
-        // Bear TL break: close ABOVE the bear trendline → bullish signal
-        if (ActiveBearTrendLine != null)
+        // Bear TL break: close ABOVE the bear trendline with margin → bullish signal
+        if (ActiveBearTrendLine != null && atr20 > 0)
         {
             double tlPrice = ActiveBearTrendLine.GetPriceAt(currentIndex);
-            if (close > tlPrice)
+            double breakDistance = close - tlPrice; // Positive = close is above TL
+            if (breakDistance > margin)
             {
+                int barsBetween = ActiveBearTrendLine.Point2.BarIndex - ActiveBearTrendLine.Point1.BarIndex;
                 HasBearTlb = true;
                 TlbCount++;
                 LastTlb = new TlbInfo
@@ -175,13 +219,13 @@ public class TrendLineTracker
                     IsMajorBreak = ActiveBearTrendLine.IsMajor,
                     Strength = CalculateTlbStrength(bars, currentIndex, close, ActiveBearTrendLine, ema20, atr20, isBullBreak: true)
                 };
+                _logger.Debug($"TLB detected: {(LastTlb.IsMajorBreak ? "MAJOR" : "MICRO")} Bear TL broken | Strength={LastTlb.Strength:F2} | Bars between points={barsBetween}");
             }
         }
     }
 
     /// <summary>
     /// Calculates TLB strength (0.0–1.0) based on Brooks' criteria.
-    /// Stronger TLBs make the subsequent MTR setup more reliable.
     /// </summary>
     private double CalculateTlbStrength(Bars bars, int currentIndex, double breakPrice,
         TrendLine brokenLine, double ema20, double atr20, bool isBullBreak)
@@ -192,44 +236,27 @@ public class TrendLineTracker
         double tlPrice = brokenLine.GetPriceAt(currentIndex);
         double moveDistance = Math.Abs(breakPrice - tlPrice);
 
-        // Move covers many pips (> 2x ATR) → +0.15
-        if (moveDistance > 2.0 * atr20)
-            strength += 0.15;
+        if (moveDistance > 2.0 * atr20) strength += 0.15;
 
-        // Goes well beyond the EMA → +0.15
-        bool beyondEma = isBullBreak
-            ? breakPrice > ema20
-            : breakPrice < ema20;
-        if (beyondEma)
-            strength += 0.15;
+        bool beyondEma = isBullBreak ? breakPrice > ema20 : breakPrice < ema20;
+        if (beyondEma) strength += 0.15;
 
-        // Extends beyond the last opposing swing → +0.15
         if (isBullBreak)
         {
-            // Bear TLB (bullish): extends above the last Lower High
             var lastHigh = _swingTracker.LastSwingHigh;
-            if (lastHigh != null && breakPrice > lastHigh.Price)
-                strength += 0.15;
+            if (lastHigh != null && breakPrice > lastHigh.Price) strength += 0.15;
         }
         else
         {
-            // Bull TLB (bearish): extends below the last Higher Low
             var lastLow = _swingTracker.LastSwingLow;
-            if (lastLow != null && breakPrice < lastLow.Price)
-                strength += 0.15;
+            if (lastLow != null && breakPrice < lastLow.Price) strength += 0.15;
         }
 
-        // Lasts many bars (> 10 bars since TL was drawn) → +0.10
         int barsSinceTl = currentIndex - brokenLine.Point2.BarIndex;
-        if (barsSinceTl > 10)
-            strength += 0.10;
+        if (barsSinceTl > 10) strength += 0.10;
 
-        // Prior TLBs exist (not the first one) → +0.10
-        // Brooks: second and third TLBs are more significant
-        if (TlbCount > 1)
-            strength += 0.10;
+        if (TlbCount > 1) strength += 0.10;
 
-        // Momentum: majority of recent bars are trend bars in break direction → +0.20
         int lookback = Math.Min(10, currentIndex);
         int trendBarCount = 0;
         for (int i = currentIndex - lookback + 1; i <= currentIndex; i++)
@@ -247,7 +274,6 @@ public class TrendLineTracker
 
     /// <summary>
     /// Represents a trendline connecting two swing points.
-    /// Extrapolates price at any bar index using linear projection.
     /// </summary>
     public class TrendLine
     {
@@ -261,15 +287,12 @@ public class TrendLineTracker
         public double Slope { get; set; }
 
         /// <summary>
-        /// True if this is a Major trendline (≥20 bars between anchor points).
+        /// True if this is a Major trendline (≥12 bars between anchor points on M5 = 1 hour).
         /// Only Major TL breaks qualify for MTR setups.
-        /// Micro TL breaks (IsMajor=false) are With Trend entries per Brooks.
         /// </summary>
         public bool IsMajor { get; set; }
 
-        /// <summary>
-        /// Extrapolates the trendline price at the given bar index.
-        /// </summary>
+        /// <summary>Extrapolates the trendline price at the given bar index.</summary>
         public double GetPriceAt(int barIndex)
         {
             int barsDiff = barIndex - Point1.BarIndex;
@@ -294,10 +317,7 @@ public class TrendLineTracker
         /// <summary>Strength of the break (0.0–1.0) based on Brooks' criteria.</summary>
         public double Strength { get; set; }
 
-        /// <summary>
-        /// True if this is a Major TL break (≥20 bars between anchor points).
-        /// Only Major breaks qualify for MTR. Micro breaks are With Trend entries.
-        /// </summary>
+        /// <summary>True if this is a Major TL break. Only Major breaks qualify for MTR.</summary>
         public bool IsMajorBreak { get; set; }
     }
 }

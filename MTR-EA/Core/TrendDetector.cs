@@ -12,13 +12,19 @@ namespace cAlgo.Robots.Core;
 
 /// <summary>
 /// Classifies the market as Bull Trend, Bear Trend, or Trading Range on each bar.
-/// Computes trend strength (0.0–1.0) based on Al Brooks' Signs of Strength,
-/// Always In direction, and Two-Hour Move detection.
+/// Uses hysteresis to prevent rapid oscillation between states:
+/// - Enter trend (from Range): requires strength ≥ 0.40
+/// - Exit trend (to Range): requires strength to drop below 0.20
+/// - Bull↔Bear direct flip: allowed without hysteresis when swing structure changes clearly.
 /// </summary>
 public class TrendDetector
 {
     private readonly SwingPointTracker _swingTracker;
     private readonly int _lookbackBars;
+
+    // Hysteresis thresholds
+    private const double EnterTrendThreshold = 0.40;
+    private const double ExitTrendThreshold = 0.20;
 
     private TrendDirection _previousDirection = TrendDirection.Range;
     private int _barsSinceTrendStart;
@@ -41,13 +47,14 @@ public class TrendDetector
     /// Updates the trend classification based on current market data.
     /// Should be called once per bar after SwingPointTracker.Update().
     /// </summary>
-    /// <param name="bars">The cTrader Bars data series.</param>
-    /// <param name="currentIndex">Index of the closed bar being analyzed.</param>
-    /// <param name="ema20">Current EMA 20 value.</param>
-    /// <param name="atr20">Current ATR 20 value.</param>
     public void Update(Bars bars, int currentIndex, double ema20, double atr20)
     {
-        var direction = DetectDirection();
+        var rawDirection = DetectRawDirection();
+        var strength = CalculateStrength(bars, currentIndex, rawDirection, ema20, atr20);
+
+        // Apply hysteresis to prevent rapid Scanning↔Trending oscillation
+        var direction = ApplyHysteresis(rawDirection, strength);
+
         var swingCount = CountAlignedSwings(direction);
 
         // Track bars since trend started
@@ -61,7 +68,6 @@ public class TrendDetector
         }
         _previousDirection = direction;
 
-        var strength = CalculateStrength(bars, currentIndex, direction, ema20, atr20);
         var isTwoHourMove = DetectTwoHourMove(bars, currentIndex, ema20);
 
         // Brooks' Always In: strong trend = forced side
@@ -83,10 +89,10 @@ public class TrendDetector
     }
 
     /// <summary>
-    /// Determines trend direction from swing point structure.
+    /// Determines raw trend direction from swing point structure (no hysteresis).
     /// Bull = HH + HL, Bear = LH + LL, otherwise Range.
     /// </summary>
-    private TrendDirection DetectDirection()
+    private TrendDirection DetectRawDirection()
     {
         bool hasHH = _swingTracker.HasHigherHighs(2);
         bool hasHL = _swingTracker.HasHigherLows(2);
@@ -99,6 +105,36 @@ public class TrendDetector
     }
 
     /// <summary>
+    /// Applies hysteresis to direction changes to prevent rapid oscillation.
+    /// - Range → Bull/Bear: requires strength ≥ 0.40
+    /// - Bull/Bear → Range: requires strength to drop below 0.20
+    /// - Bull ↔ Bear: direct flip allowed when swing structure changes clearly (no hysteresis)
+    /// </summary>
+    private TrendDirection ApplyHysteresis(TrendDirection rawDirection, double strength)
+    {
+        // Direct Bull↔Bear flip: swing structure changed clearly, allow without hysteresis
+        if (_previousDirection == TrendDirection.Bull && rawDirection == TrendDirection.Bear)
+            return TrendDirection.Bear;
+        if (_previousDirection == TrendDirection.Bear && rawDirection == TrendDirection.Bull)
+            return TrendDirection.Bull;
+
+        // Range → Trend: need strong enough signal to enter
+        if (_previousDirection == TrendDirection.Range && rawDirection != TrendDirection.Range)
+        {
+            return strength >= EnterTrendThreshold ? rawDirection : TrendDirection.Range;
+        }
+
+        // Trend → Range: need weakness to exit (maintain trend if strength is still moderate)
+        if (_previousDirection != TrendDirection.Range && rawDirection == TrendDirection.Range)
+        {
+            return strength >= ExitTrendThreshold ? _previousDirection : TrendDirection.Range;
+        }
+
+        // Same direction or same state — keep raw
+        return rawDirection;
+    }
+
+    /// <summary>
     /// Counts aligned swing points (HH+HL pairs for bull, LH+LL pairs for bear).
     /// </summary>
     private int CountAlignedSwings(TrendDirection direction)
@@ -108,11 +144,10 @@ public class TrendDetector
         int count = 0;
         if (direction == TrendDirection.Bull)
         {
-            // Count how many consecutive HH we have (up to 5)
             for (int n = 2; n <= 5; n++)
             {
                 if (_swingTracker.HasHigherHighs(n) && _swingTracker.HasHigherLows(n))
-                    count = n * 2; // Each n means n highs + n lows aligned
+                    count = n * 2;
                 else break;
             }
         }
@@ -131,7 +166,6 @@ public class TrendDetector
 
     /// <summary>
     /// Calculates trend strength (0.0–1.0) based on 11 active Signs of Strength from Al Brooks.
-    /// Factor #3 removed from MVP (would create circular dependency with TrendLineTracker).
     /// </summary>
     private double CalculateStrength(Bars bars, int currentIndex, TrendDirection direction, double ema20, double atr20)
     {
@@ -141,7 +175,6 @@ public class TrendDetector
         bool isBull = direction == TrendDirection.Bull;
         double strength = 0.0;
 
-        // Build recent BarInfos for analysis
         int lookback = Math.Min(_lookbackBars, currentIndex);
         var recentBars = new List<BarInfo>();
         BarInfo? prev = null;
@@ -155,139 +188,103 @@ public class TrendDetector
 
         if (recentBars.Count < 5) return 0.0;
 
-        // Factor 1: Trending highs and lows (swings aligned) → +0.10
+        // Factor 1: Trending highs and lows → +0.10
         if (isBull ? (_swingTracker.HasHigherHighs(2) && _swingTracker.HasHigherLows(2))
                    : (_swingTracker.HasLowerHighs(2) && _swingTracker.HasLowerLows(2)))
             strength += 0.10;
 
-        // Factor 2: No climaxes (few bars with range > 2x ATR) → +0.08
+        // Factor 2: No climaxes → +0.08
         int climaxCount = recentBars.TakeLast(20).Count(b => b.Range > 2.0 * atr20);
-        if (climaxCount <= 1)
-            strength += 0.08;
+        if (climaxCount <= 1) strength += 0.08;
 
-        // Factor 3: REMOVED from MVP (TrendLineTracker dependency)
+        // Factor 4: 2HM → +0.10
+        if (DetectTwoHourMove(bars, currentIndex, ema20)) strength += 0.10;
 
-        // Factor 4: 2HM — price far from EMA for many bars (>24 bars = 2h on M5) → +0.10
-        if (DetectTwoHourMove(bars, currentIndex, ema20))
-            strength += 0.10;
+        // Factor 5: Small pullbacks → +0.10
+        if (HasSmallPullbacks(recentBars, atr20, isBull)) strength += 0.10;
 
-        // Factor 5: Small pullbacks (each pullback < 40% of ATR * 3) → +0.10
-        if (HasSmallPullbacks(recentBars, atr20, isBull))
-            strength += 0.10;
+        // Factor 6: No consecutive closes wrong side of EMA → +0.10
+        if (!HasConsecutiveClosesWrongSide(recentBars, ema20, isBull)) strength += 0.10;
 
-        // Factor 6: No two consecutive closes on the wrong side of EMA → +0.10
-        if (!HasConsecutiveClosesWrongSide(recentBars, ema20, isBull))
-            strength += 0.10;
-
-        // Factor 7: Small tails (average tail < 30% of range) → +0.08
+        // Factor 7: Small tails → +0.08
         var last20 = recentBars.TakeLast(20).Where(b => b.Range > 0).ToList();
         if (last20.Count > 0)
         {
             double avgTailPercent = isBull
                 ? last20.Average(b => b.UpperTailPercent)
                 : last20.Average(b => b.LowerTailPercent);
-            if (avgTailPercent < 0.30)
-                strength += 0.08;
+            if (avgTailPercent < 0.30) strength += 0.08;
         }
 
-        // Factor 8: Trending closes (last 5 bars with progressive closes) → +0.08
-        if (BarHelpers.HasTrendingCloses(recentBars, 5, isBull))
-            strength += 0.08;
+        // Factor 8: Trending closes → +0.08
+        if (BarHelpers.HasTrendingCloses(recentBars, 5, isBull)) strength += 0.08;
 
-        // Factor 9: Shrinking Stairs → -0.15 (REDUCES strength — momentum decay)
-        if (_swingTracker.HasShrinkingStairs())
-            strength -= 0.15;
+        // Factor 9: Shrinking Stairs → -0.15
+        if (_swingTracker.HasShrinkingStairs()) strength -= 0.15;
 
-        // Factor 10: Many trend bars in direction (>60% of last 20) → +0.10
+        // Factor 10: Many trend bars (>60% of last 20) → +0.10
         var last20Bars = recentBars.TakeLast(20).ToList();
         if (last20Bars.Count >= 10)
         {
             int trendBarCount = isBull
                 ? last20Bars.Count(b => b.IsBull && b.BodyPercent > 0.40)
                 : last20Bars.Count(b => b.IsBear && b.BodyPercent > 0.40);
-            if ((double)trendBarCount / last20Bars.Count > 0.60)
-                strength += 0.10;
+            if ((double)trendBarCount / last20Bars.Count > 0.60) strength += 0.10;
         }
 
-        // Factor 11: EMA slope aligned with direction → +0.08
+        // Factor 11: EMA slope aligned → +0.08
         if (currentIndex >= 5)
         {
-            double emaSlope = ema20 - bars.ClosePrices[currentIndex - 5]; // Approximate slope
-            // Use EMA values would be ideal, but we approximate with close vs current EMA
             double emaCurrent = ema20;
-            double emaPast = bars.ClosePrices[currentIndex - 5]; // Rough proxy
+            double emaPast = bars.ClosePrices[currentIndex - 5];
             if ((isBull && emaCurrent > emaPast) || (!isBull && emaCurrent < emaPast))
                 strength += 0.08;
         }
 
-        // Factor 12: Consecutive bars in trend direction (>5 without pullback) → +0.10
+        // Factor 12: Consecutive bars in trend direction (>5) → +0.10
         int consecutive = 0;
         for (int i = recentBars.Count - 1; i >= 0; i--)
         {
             if (isBull ? recentBars[i].IsBull : recentBars[i].IsBear)
                 consecutive++;
-            else
-                break;
+            else break;
         }
-        if (consecutive > 5)
-            strength += 0.10;
+        if (consecutive > 5) strength += 0.10;
 
         return Math.Clamp(strength, 0.0, 1.0);
     }
 
-    /// <summary>
-    /// Detects Two-Hour Move: price hasn't touched EMA20 for 24+ bars (2 hours on M5).
-    /// Brooks considers this a sign of strong trend — institutions are in control.
-    /// </summary>
     private bool DetectTwoHourMove(Bars bars, int currentIndex, double ema20)
     {
-        const int twoHourBars = 24; // 24 x 5min = 2 hours
+        const int twoHourBars = 24;
         int barsSinceEmaTouch = 0;
 
         for (int i = currentIndex; i >= Math.Max(0, currentIndex - twoHourBars * 2); i--)
         {
             double low = bars.LowPrices[i];
             double high = bars.HighPrices[i];
-
-            // Bar touched EMA if EMA is between low and high
-            if (low <= ema20 && high >= ema20)
-                break;
-
+            if (low <= ema20 && high >= ema20) break;
             barsSinceEmaTouch++;
         }
 
         return barsSinceEmaTouch > twoHourBars;
     }
 
-    /// <summary>
-    /// Checks if pullbacks are small relative to ATR.
-    /// Brooks: in a strong trend, pullbacks should be < 40% of recent swing distance.
-    /// </summary>
     private bool HasSmallPullbacks(List<BarInfo> recentBars, double atr20, bool isBull)
     {
-        double maxPullback = atr20 * 3.0 * 0.40; // 40% of 3x ATR
-
-        // Find the deepest pullback in recent bars
+        double maxPullback = atr20 * 3.0 * 0.40;
         double extremePrice = isBull ? recentBars.Max(b => b.High) : recentBars.Min(b => b.Low);
         double worstPullback = 0;
 
         foreach (var bar in recentBars.TakeLast(20))
         {
-            double pullback = isBull
-                ? extremePrice - bar.Low
-                : bar.High - extremePrice;
-
-            if (pullback > worstPullback)
-                worstPullback = pullback;
+            double pullback = isBull ? extremePrice - bar.Low : bar.High - extremePrice;
+            if (pullback > worstPullback) worstPullback = pullback;
         }
 
         return worstPullback < maxPullback;
     }
 
-    /// <summary>
-    /// Checks if there are two consecutive closes on the wrong side of EMA.
-    /// Brooks: this weakens the trend case significantly.
-    /// </summary>
     private bool HasConsecutiveClosesWrongSide(List<BarInfo> recentBars, double ema20, bool isBull)
     {
         var last10 = recentBars.TakeLast(10).ToList();
@@ -295,8 +292,7 @@ public class TrendDetector
         {
             bool prevWrong = isBull ? last10[i - 1].Close < ema20 : last10[i - 1].Close > ema20;
             bool currWrong = isBull ? last10[i].Close < ema20 : last10[i].Close > ema20;
-            if (prevWrong && currWrong)
-                return true;
+            if (prevWrong && currWrong) return true;
         }
         return false;
     }
