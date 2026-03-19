@@ -18,7 +18,6 @@ public class TrendLineCandidateGenerator
     private readonly int _maxBarsBetweenPoints;
     private readonly double _maxSlopePerBar;
     private const int MaxSwingPoints = 15;
-    private const double SlopeTolerance = 0.00005; // Allow slightly counter-directional slopes
 
     /// <summary>
     /// Creates a new candidate generator.
@@ -75,16 +74,16 @@ public class TrendLineCandidateGenerator
 
                 double slope = (p2.Price - p1.Price) / barsBetween;
 
-                // Check slope direction
+                // Check slope direction — no tolerance allowed
                 if (direction == TrendLineDirection.Bull)
                 {
-                    // Bull TL (support) should have slope >= 0 or very slightly negative
-                    if (slope < -SlopeTolerance) continue;
+                    // Bull TL (support) must have slope >= 0 — descending lows are not valid support
+                    if (slope < 0) continue;
                 }
                 else
                 {
-                    // Bear TL (resistance) should have slope <= 0 or very slightly positive
-                    if (slope > SlopeTolerance) continue;
+                    // Bear TL (resistance) must have slope <= 0 — ascending highs are not valid resistance
+                    if (slope > 0) continue;
                 }
 
                 // Check max slope
