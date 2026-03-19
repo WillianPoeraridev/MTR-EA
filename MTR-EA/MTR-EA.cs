@@ -33,6 +33,11 @@ public class MTREA : Robot
     [Parameter("Signal Bar Min Score", DefaultValue = 60, MinValue = 30, MaxValue = 90)]
     public int SignalBarMinScore { get; set; }
 
+    // === Visual Debug Parameter ===
+
+    [Parameter("Show Visual Debug", DefaultValue = true)]
+    public bool ShowVisualDebug { get; set; }
+
     // === Indicators ===
     private ExponentialMovingAverage _ema20 = null!;
     private AverageTrueRange _atr20 = null!;
@@ -46,6 +51,9 @@ public class MTREA : Robot
     private TrendLineTracker _tlTracker = null!;
     private SignalBarAnalyzer _signalAnalyzer = null!;
     private MtrDetector _mtrDetector = null!;
+
+    // === Visual Debug State ===
+    private MtrState _previousMtrState = MtrState.Scanning;
 
     protected override void OnStart()
     {
@@ -72,7 +80,7 @@ public class MTREA : Robot
             cooldownBars: 5,
             maxFailedAttempts: 2);
 
-        _logger.Info("MTR-EA started — Phase 2 (Detection)");
+        _logger.Info("MTR-EA started — Phase 2 (Detection + Visual Debug)");
     }
 
     protected override void OnBar()
@@ -85,12 +93,15 @@ public class MTREA : Robot
         if (Bars.Count < 30) return;
 
         int closedBarIndex = Bars.Count - 2;
-        int currentIndex = Bars.Count - 1; // Used by SwingPointTracker for range check
+        int currentIndex = Bars.Count - 1;
         double ema = _ema20.Result[closedBarIndex];
         double atr = _atr20.Result[closedBarIndex];
 
         // Build recent BarInfos for context analysis (based on CLOSED bars)
         var recentBars = BuildRecentBars(10);
+
+        // Capture swing point count BEFORE update to detect new ones
+        int swingCountBefore = _swingTracker.GetAll().Count;
 
         // Detection pipeline (ORDER MATTERS)
         _swingTracker.Update(Bars, currentIndex);
@@ -110,6 +121,17 @@ public class MTREA : Robot
                 $"Reasons={setup.ReasonCount}");
         }
 
+        // === Visual Debug Markers ===
+        if (ShowVisualDebug)
+        {
+            DrawNewSwingPoints(swingCountBefore, atr);
+            DrawTrendLines();
+            DrawTlbEvents(closedBarIndex, atr);
+            DrawMtrStateTransitions(closedBarIndex, atr, setup);
+            DrawSignalBar(closedBarIndex, atr, setup);
+            DrawDebugPanel(setup);
+        }
+
         // Phase 3 will add: SessionFilter + EntryManager + TradeManager here
     }
 
@@ -117,6 +139,234 @@ public class MTREA : Robot
     {
         _logger.Info("MTR-EA stopped");
     }
+
+    // =========================================
+    // VISUAL DEBUG — Drawing Methods
+    // =========================================
+
+    /// <summary>
+    /// Draws icons for newly confirmed swing points.
+    /// SH = blue down-triangle above the bar, SL = red up-triangle below the bar.
+    /// </summary>
+    private void DrawNewSwingPoints(int countBefore, double atr)
+    {
+        var allSwings = _swingTracker.GetAll();
+        if (allSwings.Count <= countBefore) return;
+
+        // Draw only the NEW swing points added this bar
+        for (int i = countBefore; i < allSwings.Count; i++)
+        {
+            var sp = allSwings[i];
+            if (sp.Type == SwingType.High)
+            {
+                Chart.DrawIcon(
+                    $"SH_{sp.BarIndex}",
+                    ChartIconType.DownTriangle,
+                    Bars.OpenTimes[sp.BarIndex],
+                    sp.Price + (atr * 0.3),
+                    Color.DodgerBlue);
+            }
+            else
+            {
+                Chart.DrawIcon(
+                    $"SL_{sp.BarIndex}",
+                    ChartIconType.UpTriangle,
+                    Bars.OpenTimes[sp.BarIndex],
+                    sp.Price - (atr * 0.3),
+                    Color.OrangeRed);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Draws active trendlines on the chart.
+    /// Bull TL (support) = green, Bear TL (resistance) = red.
+    /// Major TLs are thick solid lines, Micro TLs are thin dotted.
+    /// </summary>
+    private void DrawTrendLines()
+    {
+        if (_tlTracker.ActiveBullTrendLine != null)
+        {
+            var tl = _tlTracker.ActiveBullTrendLine;
+            Chart.DrawTrendLine(
+                "BullTL",
+                Bars.OpenTimes[tl.Point1.BarIndex],
+                tl.Point1.Price,
+                Bars.OpenTimes[tl.Point2.BarIndex],
+                tl.Point2.Price,
+                tl.IsMajor ? Color.Lime : Color.DarkGreen,
+                tl.IsMajor ? 2 : 1,
+                tl.IsMajor ? LineStyle.Solid : LineStyle.Dots);
+            var tlObj = Chart.FindObject("BullTL") as ChartTrendLine;
+            if (tlObj != null) tlObj.ExtendToInfinity = true;
+        }
+
+        if (_tlTracker.ActiveBearTrendLine != null)
+        {
+            var tl = _tlTracker.ActiveBearTrendLine;
+            Chart.DrawTrendLine(
+                "BearTL",
+                Bars.OpenTimes[tl.Point1.BarIndex],
+                tl.Point1.Price,
+                Bars.OpenTimes[tl.Point2.BarIndex],
+                tl.Point2.Price,
+                tl.IsMajor ? Color.Red : Color.DarkRed,
+                tl.IsMajor ? 2 : 1,
+                tl.IsMajor ? LineStyle.Solid : LineStyle.Dots);
+            var tlObj = Chart.FindObject("BearTL") as ChartTrendLine;
+            if (tlObj != null) tlObj.ExtendToInfinity = true;
+        }
+    }
+
+    /// <summary>
+    /// Draws arrows and text labels when a Trend Line Break event fires.
+    /// Bull TLB (bearish) = red down-arrow, Bear TLB (bullish) = green up-arrow.
+    /// </summary>
+    private void DrawTlbEvents(int closedBarIndex, double atr)
+    {
+        if (_tlTracker.HasBullTlb)
+        {
+            Chart.DrawIcon(
+                $"TLB_{closedBarIndex}",
+                ChartIconType.DownArrow,
+                Bars.OpenTimes[closedBarIndex],
+                Bars.HighPrices[closedBarIndex] + (atr * 0.5),
+                Color.Red);
+            Chart.DrawText(
+                $"TLBtxt_{closedBarIndex}",
+                "TLB\u2193",
+                Bars.OpenTimes[closedBarIndex],
+                Bars.HighPrices[closedBarIndex] + (atr * 0.7),
+                Color.Red);
+        }
+
+        if (_tlTracker.HasBearTlb)
+        {
+            Chart.DrawIcon(
+                $"TLB_{closedBarIndex}",
+                ChartIconType.UpArrow,
+                Bars.OpenTimes[closedBarIndex],
+                Bars.LowPrices[closedBarIndex] - (atr * 0.5),
+                Color.Lime);
+            Chart.DrawText(
+                $"TLBtxt_{closedBarIndex}",
+                "TLB\u2191",
+                Bars.OpenTimes[closedBarIndex],
+                Bars.LowPrices[closedBarIndex] - (atr * 0.7),
+                Color.Lime);
+        }
+    }
+
+    /// <summary>
+    /// Draws state labels ONLY on state transitions (not every bar).
+    /// Cleans up entry/stop/target lines when leaving Triggered state.
+    /// </summary>
+    private void DrawMtrStateTransitions(int closedBarIndex, double atr, MtrSetup? setup)
+    {
+        MtrState currentMtrState = setup?.CurrentState ?? MtrState.Scanning;
+
+        if (currentMtrState == _previousMtrState) return;
+
+        // Clean up entry/stop/target lines when leaving Triggered state
+        if (_previousMtrState == MtrState.Triggered)
+        {
+            Chart.RemoveObject("ActiveEntry");
+            Chart.RemoveObject("ActiveStop");
+            Chart.RemoveObject("ActiveTarget");
+        }
+
+        if (currentMtrState != MtrState.Scanning && setup != null)
+        {
+            string stateLabel = currentMtrState switch
+            {
+                MtrState.Trending  => "TREND",
+                MtrState.TlbActive => "TLB!",
+                MtrState.Testing   => $"TEST ({setup.TestType})",
+                MtrState.Triggered => "\u25B6 TRIGGERED",
+                MtrState.InTrade   => "IN TRADE",
+                MtrState.Cooldown  => "cooldown",
+                _                  => ""
+            };
+
+            Color stateColor = currentMtrState switch
+            {
+                MtrState.Trending  => Color.Gray,
+                MtrState.TlbActive => Color.Yellow,
+                MtrState.Testing   => Color.Orange,
+                MtrState.Triggered => Color.Cyan,
+                MtrState.InTrade   => Color.Lime,
+                MtrState.Cooldown  => Color.DarkGray,
+                _                  => Color.White
+            };
+
+            double yPosition = setup.Direction == MtrDirection.BullReversal
+                ? Bars.LowPrices[closedBarIndex] - (atr * 1.0)
+                : Bars.HighPrices[closedBarIndex] + (atr * 1.0);
+
+            Chart.DrawText(
+                $"State_{closedBarIndex}",
+                stateLabel,
+                Bars.OpenTimes[closedBarIndex],
+                yPosition,
+                stateColor);
+        }
+
+        _previousMtrState = currentMtrState;
+    }
+
+    /// <summary>
+    /// Highlights the signal bar with a diamond and draws entry/stop/target horizontal lines
+    /// when the setup transitions to Triggered.
+    /// </summary>
+    private void DrawSignalBar(int closedBarIndex, double atr, MtrSetup? setup)
+    {
+        if (setup == null || setup.CurrentState != MtrState.Triggered || setup.SignalBarIndex != closedBarIndex)
+            return;
+
+        bool isBull = setup.Direction == MtrDirection.BullReversal;
+        Color sigColor = isBull ? Color.Lime : Color.Red;
+
+        Chart.DrawIcon(
+            $"SIG_{closedBarIndex}",
+            ChartIconType.Diamond,
+            Bars.OpenTimes[closedBarIndex],
+            isBull
+                ? Bars.LowPrices[closedBarIndex] - (atr * 0.5)
+                : Bars.HighPrices[closedBarIndex] + (atr * 0.5),
+            sigColor);
+
+        // Fixed names for easy removal on state change
+        Chart.DrawHorizontalLine("ActiveEntry", setup.EntryPrice, Color.Cyan, 1, LineStyle.Dots);
+        Chart.DrawHorizontalLine("ActiveStop", setup.StopPrice, Color.Red, 1, LineStyle.Dots);
+        Chart.DrawHorizontalLine("ActiveTarget", setup.TargetPrice, Color.Lime, 1, LineStyle.Dots);
+    }
+
+    /// <summary>
+    /// Draws a fixed info panel in the top-left corner showing trend and MTR status.
+    /// </summary>
+    private void DrawDebugPanel(MtrSetup? setup)
+    {
+        var trend = _trendDetector.CurrentTrend;
+
+        string trendInfo = $"Trend: {trend.Direction} " +
+            $"| Str: {trend.Strength:F2} " +
+            $"| AlwaysIn: {trend.AlwaysIn}";
+
+        string mtrInfo = setup != null
+            ? $"MTR: {setup.CurrentState} | {setup.Direction} | Reasons: {setup.ReasonCount}"
+            : "MTR: Scanning";
+
+        Chart.DrawStaticText(
+            "DebugPanel",
+            trendInfo + "\n" + mtrInfo,
+            VerticalAlignment.Top,
+            HorizontalAlignment.Left,
+            Color.White);
+    }
+
+    // =========================================
+    // HELPERS
+    // =========================================
 
     /// <summary>
     /// Builds a list of recent BarInfo objects for context analysis.
