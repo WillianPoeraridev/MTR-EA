@@ -18,7 +18,7 @@ namespace cAlgo.Robots.Core;
 public class MtrDetector
 {
     private readonly TrendDetector _trendDetector;
-    private readonly TrendLineTracker _tlTracker;
+    private readonly TrendLineManager _tlManager;
     private readonly SignalBarAnalyzer _signalAnalyzer;
     private readonly SwingPointTracker _swingTracker;
     private readonly Logger _logger;
@@ -42,7 +42,7 @@ public class MtrDetector
     /// </summary>
     public MtrDetector(
         TrendDetector trendDetector,
-        TrendLineTracker tlTracker,
+        TrendLineManager tlManager,
         SignalBarAnalyzer signalAnalyzer,
         SwingPointTracker swingTracker,
         Logger logger,
@@ -57,7 +57,7 @@ public class MtrDetector
         int minSwingTemporalSpan = 20)
     {
         _trendDetector = trendDetector;
-        _tlTracker = tlTracker;
+        _tlManager = tlManager;
         _signalAnalyzer = signalAnalyzer;
         _swingTracker = swingTracker;
         _logger = logger;
@@ -79,7 +79,6 @@ public class MtrDetector
         Bars bars, int currentIndex, double ema20, double atr20,
         List<BarInfo> recentBars, double pipSize)
     {
-        // Increment bar counter BEFORE evaluating transitions
         if (ActiveSetup != null)
             ActiveSetup.BarsSinceStateChange++;
 
@@ -112,21 +111,18 @@ public class MtrDetector
         return ActiveSetup;
     }
 
-    /// <summary>Caller informs that the pending order was filled and position is open.</summary>
     public void SetFilled()
     {
         if (ActiveSetup?.CurrentState == MtrState.Triggered)
             TransitionTo(MtrState.InTrade, "Order filled — position open");
     }
 
-    /// <summary>Caller informs that the trade was closed (TP, SL, or manual).</summary>
     public void SetClosed()
     {
         if (ActiveSetup?.CurrentState == MtrState.InTrade)
             TransitionTo(MtrState.Cooldown, "Trade closed — entering cooldown");
     }
 
-    /// <summary>Force reset to Scanning state (manual override).</summary>
     public void ForceReset()
     {
         var oldState = ActiveSetup?.CurrentState.ToString() ?? "null";
@@ -138,13 +134,6 @@ public class MtrDetector
     // STATE PROCESSORS
     // =========================================
 
-    /// <summary>
-    /// SCANNING: Looking for a clear trend to potentially reverse.
-    /// Transition → TRENDING when:
-    /// - Direction ≠ Range, SwingCount ≥ 4, Strength ≥ 0.40
-    /// - Swings cover at least 20 bars temporal span (not 4 swings in 10 bars)
-    /// Direction is set to the OPPOSITE of the detected trend (we trade reversals).
-    /// </summary>
     private void ProcessScanning()
     {
         var trend = _trendDetector.CurrentTrend;
@@ -153,18 +142,13 @@ public class MtrDetector
             && trend.SwingCount >= 4
             && trend.Strength >= 0.40)
         {
-            // Verify swings cover sufficient temporal range
-            // 4 swings in 10 bars is noise, not a trend
-            if (!HasSufficientSwingSpan(trend.Direction))
+            if (!HasSufficientSwingSpan())
                 return;
 
             ActiveSetup = new MtrSetup
             {
                 CurrentState = MtrState.Scanning,
                 DetectedAt = DateTime.UtcNow,
-                // FIX 4: Direction = OPPOSITE of detected trend (we trade reversals)
-                // Bull trend → we expect BearReversal (sell the top)
-                // Bear trend → we expect BullReversal (buy the bottom)
                 Direction = trend.Direction == TrendDirection.Bull
                     ? MtrDirection.BearReversal
                     : MtrDirection.BullReversal
@@ -173,30 +157,23 @@ public class MtrDetector
         }
     }
 
-    /// <summary>
-    /// TRENDING: Confirmed trend — monitoring for a Major Trend Line Break.
-    /// Minimum _minBarsInTrending (30 min on M5) before allowing exit to Scanning.
-    /// </summary>
     private void ProcessTrending(Bars bars, int currentIndex)
     {
         var trend = _trendDetector.CurrentTrend;
 
-        // Transition → SCANNING: trend collapsed to Range
-        // But enforce minimum time in Trending to prevent rapid oscillation
         if (trend.Direction == TrendDirection.Range)
         {
             if (ActiveSetup!.BarsSinceStateChange < _minBarsInTrending)
-                return; // Too early to abandon — hysteresis
+                return;
             TransitionTo(MtrState.Scanning, "Trend collapsed to Range");
             ActiveSetup = null;
             return;
         }
 
-        // Check for TLB events
-        // Bull trend → Bull TL (support) broken → bearish signal → BearReversal MTR
-        if (trend.Direction == TrendDirection.Bull && _tlTracker.HasBullTlb)
+        // Bull trend → Bull TL (support) broken → BearReversal MTR
+        if (trend.Direction == TrendDirection.Bull && _tlManager.HasBullTlb)
         {
-            var tlb = _tlTracker.LastTlb;
+            var tlb = _tlManager.LastTlb;
             if (tlb != null && tlb.IsMajorBreak)
             {
                 ActiveSetup!.Direction = MtrDirection.BearReversal;
@@ -204,15 +181,15 @@ public class MtrDetector
                 ActiveSetup.TlbStrength = tlb.Strength;
                 var lastHigh = _swingTracker.LastSwingHigh;
                 ActiveSetup.OldExtremePrice = lastHigh?.Price ?? bars.HighPrices[currentIndex];
-                TransitionTo(MtrState.TlbActive, $"Major Bull TL broken → BearReversal (TLB strength={tlb.Strength:F2})");
+                TransitionTo(MtrState.TlbActive, $"Major Bull TL broken → BearReversal (line score={tlb.LineScore:F0}, TLB strength={tlb.Strength:F2})");
                 return;
             }
         }
 
-        // Bear trend → Bear TL (resistance) broken → bullish signal → BullReversal MTR
-        if (trend.Direction == TrendDirection.Bear && _tlTracker.HasBearTlb)
+        // Bear trend → Bear TL (resistance) broken → BullReversal MTR
+        if (trend.Direction == TrendDirection.Bear && _tlManager.HasBearTlb)
         {
-            var tlb = _tlTracker.LastTlb;
+            var tlb = _tlManager.LastTlb;
             if (tlb != null && tlb.IsMajorBreak)
             {
                 ActiveSetup!.Direction = MtrDirection.BullReversal;
@@ -220,16 +197,12 @@ public class MtrDetector
                 ActiveSetup.TlbStrength = tlb.Strength;
                 var lastLow = _swingTracker.LastSwingLow;
                 ActiveSetup.OldExtremePrice = lastLow?.Price ?? bars.LowPrices[currentIndex];
-                TransitionTo(MtrState.TlbActive, $"Major Bear TL broken → BullReversal (TLB strength={tlb.Strength:F2})");
+                TransitionTo(MtrState.TlbActive, $"Major Bear TL broken → BullReversal (line score={tlb.LineScore:F0}, TLB strength={tlb.Strength:F2})");
                 return;
             }
         }
     }
 
-    /// <summary>
-    /// TLB_ACTIVE: TL was broken — waiting for the market to test the old extreme.
-    /// Minimum 3 bars for the TLB to "settle" before looking for test.
-    /// </summary>
     private void ProcessTlbActive(Bars bars, int currentIndex, double atr20)
     {
         if (ActiveSetup!.BarsSinceStateChange > _maxBarsWaitingTest)
@@ -249,23 +222,16 @@ public class MtrDetector
         {
             double distanceToExtreme = low - ActiveSetup.OldExtremePrice;
             if (Math.Abs(distanceToExtreme) < 2.0 * atr20)
-            {
                 TransitionTo(MtrState.Testing, $"Price approaching old low ({ActiveSetup.OldExtremePrice:F5}), distance={distanceToExtreme:F5}");
-            }
         }
         else
         {
             double distanceToExtreme = ActiveSetup.OldExtremePrice - high;
             if (Math.Abs(distanceToExtreme) < 2.0 * atr20)
-            {
                 TransitionTo(MtrState.Testing, $"Price approaching old high ({ActiveSetup.OldExtremePrice:F5}), distance={distanceToExtreme:F5}");
-            }
         }
     }
 
-    /// <summary>
-    /// TESTING: Price is testing the old trend extreme — classify test type and look for signal bar.
-    /// </summary>
     private void ProcessTesting(Bars bars, int currentIndex, double ema20, double atr20,
         List<BarInfo> recentBars, double pipSize)
     {
@@ -323,10 +289,6 @@ public class MtrDetector
         }
     }
 
-    /// <summary>
-    /// TRIGGERED: Setup complete — pending order placed by caller.
-    /// Timeout goes to TESTING (retry), not SCANNING — unless max attempts exceeded.
-    /// </summary>
     private void ProcessTriggered(Bars bars, int currentIndex, double atr20,
         List<BarInfo> recentBars, double pipSize)
     {
@@ -374,9 +336,6 @@ public class MtrDetector
         }
     }
 
-    /// <summary>
-    /// COOLDOWN: Pause after trade exit.
-    /// </summary>
     private void ProcessCooldown()
     {
         if (ActiveSetup!.BarsSinceStateChange > _cooldownBars)
@@ -390,25 +349,11 @@ public class MtrDetector
     // HELPER METHODS
     // =========================================
 
-    /// <summary>
-    /// Verifies that the swing points forming the trend cover at least _minSwingTemporalSpan bars.
-    /// This prevents 4 swings in 10 bars from being treated as a real trend.
-    /// </summary>
-    private bool HasSufficientSwingSpan(TrendDirection direction)
+    private bool HasSufficientSwingSpan()
     {
-        List<SwingPoint> swings;
-        if (direction == TrendDirection.Bull)
-        {
-            var highs = _swingTracker.GetRecentHighs(2);
-            var lows = _swingTracker.GetRecentLows(2);
-            swings = highs.Concat(lows).OrderBy(s => s.BarIndex).ToList();
-        }
-        else
-        {
-            var highs = _swingTracker.GetRecentHighs(2);
-            var lows = _swingTracker.GetRecentLows(2);
-            swings = highs.Concat(lows).OrderBy(s => s.BarIndex).ToList();
-        }
+        var highs = _swingTracker.GetRecentHighs(2);
+        var lows = _swingTracker.GetRecentLows(2);
+        var swings = highs.Concat(lows).OrderBy(s => s.BarIndex).ToList();
 
         if (swings.Count < 2) return false;
 
@@ -481,18 +426,15 @@ public class MtrDetector
                 setup.StopPrice = setup.EntryPrice - moneyStop;
             else
                 setup.StopPrice = setup.EntryPrice + moneyStop;
-            stopDistance = moneyStop;
         }
 
-        double tlbBreakPrice = _tlTracker.LastTlb?.BreakPrice ?? setup.EntryPrice;
+        double tlbBreakPrice = _tlManager.LastTlb?.BreakPrice ?? setup.EntryPrice;
         double moveDistance = Math.Abs(setup.OldExtremePrice - tlbBreakPrice);
         double risk = Math.Abs(setup.EntryPrice - setup.StopPrice);
 
-        double targetMM;
-        if (setup.Direction == MtrDirection.BullReversal)
-            targetMM = setup.TestPrice + moveDistance;
-        else
-            targetMM = setup.TestPrice - moveDistance;
+        double targetMM = setup.Direction == MtrDirection.BullReversal
+            ? setup.TestPrice + moveDistance
+            : setup.TestPrice - moveDistance;
 
         double maxTarget = setup.Direction == MtrDirection.BullReversal
             ? setup.EntryPrice + 3.0 * risk
