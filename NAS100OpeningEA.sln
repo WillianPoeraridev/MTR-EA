@@ -3,8 +3,6 @@ Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 16
 VisualStudioVersion = 16.0.30011.22
 MinimumVisualStudioVersion = 10.0.40219.1
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MTR-EA", "MTR-EA\MTR-EA.csproj", "{50f46fcb-d3c9-4844-8ac1-4e90067bc588}"
-EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NAS100OpeningEA", "NAS100OpeningEA\NAS100OpeningEA.csproj", "{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}"
 EndProject
 Global
@@ -13,10 +11,6 @@ Global
 		Release|Any CPU = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(ProjectConfigurationPlatforms) = postSolution
-		{50f46fcb-d3c9-4844-8ac1-4e90067bc588}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
-		{50f46fcb-d3c9-4844-8ac1-4e90067bc588}.Debug|Any CPU.Build.0 = Debug|Any CPU
-		{50f46fcb-d3c9-4844-8ac1-4e90067bc588}.Release|Any CPU.ActiveCfg = Release|Any CPU
-		{50f46fcb-d3c9-4844-8ac1-4e90067bc588}.Release|Any CPU.Build.0 = Release|Any CPU
 		{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
 		{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}.Release|Any CPU.ActiveCfg = Release|Any CPU
