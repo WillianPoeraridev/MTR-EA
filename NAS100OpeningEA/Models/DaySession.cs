@@ -6,11 +6,15 @@ namespace cAlgo.Robots.NAS100.Models;
 
 public class DaySession
 {
+    private readonly int _maxTrades;
+
     public int TradesExecuted { get; private set; }
     public ReversalDirection? LastTradeDirection { get; private set; }
     public DateTime SessionDate { get; private set; }
 
-    public bool CanTrade => TradesExecuted < 2;
+    public DaySession(int maxTrades) { _maxTrades = maxTrades; }
+
+    public bool CanTrade => TradesExecuted < _maxTrades;
 
     public void RegisterTrade(ReversalDirection dir)
     {

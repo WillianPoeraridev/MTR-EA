@@ -62,6 +62,9 @@ public class NAS100OpeningEA : Robot
     [Parameter("Log Level (0=Debug, 4=Error)", DefaultValue = 1, MinValue = 0, MaxValue = 4)]
     public int LogLevelParam { get; set; }
 
+    [Parameter("UTC Offset Hours", DefaultValue = -3, MinValue = -12, MaxValue = 14)]
+    public int UtcOffsetHours { get; set; }
+
     // =========================================
     // PRIVATE FIELDS
     // =========================================
@@ -106,7 +109,7 @@ public class NAS100OpeningEA : Robot
 
         _riskManager = new AtrRiskManager(DefaultSlPips, DefaultTpPips, MinRR, AtrSlMultiplier, Symbol.PipSize);
 
-        _daySession = new DaySession();
+        _daySession = new DaySession(MaxTradesPerDay);
         _daySession.Reset(Server.Time.Date);
 
         _logger.Info("NAS100OpeningEA started");
@@ -196,10 +199,11 @@ public class NAS100OpeningEA : Robot
 
     private bool IsInOpeningWindow()
     {
-        var open  = new TimeSpan(SessionOpenHour, SessionOpenMinute, 0);
-        var close = open.Add(TimeSpan.FromMinutes(SessionWindowMinutes));
-        var now   = Server.Time.TimeOfDay;
-        return now >= open && now <= close;
+        var localOpen = new TimeSpan(SessionOpenHour, SessionOpenMinute, 0);
+        var utcOpen   = localOpen.Add(TimeSpan.FromHours(-UtcOffsetHours));
+        var utcClose  = utcOpen.Add(TimeSpan.FromMinutes(SessionWindowMinutes));
+        var now       = Server.Time.TimeOfDay;
+        return now >= utcOpen && now <= utcClose;
     }
 
     // =========================================
@@ -265,8 +269,8 @@ public class NAS100OpeningEA : Robot
             string label = $"{level.LevelType} {level.ReversalDirection}";
 
             Chart.DrawHorizontalLine($"Level_{idx}", level.TriggerPrice, color, 1, LineStyle.Dots);
-            Chart.DrawStaticText($"LevelLbl_{idx}", label,
-                VerticalAlignment.Top, HorizontalAlignment.Right, color);
+            Chart.DrawText($"LevelLbl_{idx}", label, Bars.OpenTimes[Bars.Count - 2],
+                level.TriggerPrice, color);
 
             idx++;
         }
